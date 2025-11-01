@@ -10,6 +10,7 @@ import hashlib
 import json
 from pathlib import Path
 from dotenv import load_dotenv
+import random
 
 # Load environment variables
 load_dotenv()
@@ -25,7 +26,6 @@ class PinterestDownloader:
         self.load_database()
 
     def load_database(self):
-        """Load hashes of existing and skipped files"""
         if os.path.exists(self.db_file):
             try:
                 with open(self.db_file, 'r') as f:
@@ -45,7 +45,6 @@ class PinterestDownloader:
         print(f"Found {len(self.skipped_hashes)} skipped images (too small)")
 
     def save_database(self):
-        """Save the database of downloaded and skipped hashes"""
         db = {
             'downloaded': list(self.downloaded_hashes),
             'skipped': list(self.skipped_hashes)
@@ -54,30 +53,28 @@ class PinterestDownloader:
             json.dump(db, f, indent=2)
 
     def get_image_hash(self, img_url):
-        """Generate a hash for the image URL"""
         return hashlib.md5(img_url.encode()).hexdigest()[:12]
 
     def login_to_pinterest(self, page, username, password):
-        """Attempt to login to Pinterest with credentials"""
         try:
             print("Attempting to log in to Pinterest...")
             page.goto("https://www.pinterest.com/login/")
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(random.randint(1500, 2500))
 
             email_input = page.locator('input[id="email"]')
             if email_input.is_visible(timeout=5000):
                 email_input.fill(username)
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(random.randint(300, 600))
 
                 password_input = page.locator('input[id="password"]')
                 password_input.fill(password)
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(random.randint(300, 600))
 
                 login_button = page.locator('button[type="submit"]').first
                 login_button.click()
 
                 print("Login credentials submitted. Waiting for login to complete...")
-                page.wait_for_timeout(5000)
+                page.wait_for_timeout(random.randint(4000, 6000))
 
                 if "pinterest.com/login" not in page.url:
                     print("✓ Login successful!")
@@ -93,85 +90,111 @@ class PinterestDownloader:
             print(f"Error during automated login: {e}")
             return False
 
-    def download_pin(self, page, pin):
-        """Downloads a single pin given the pin element"""
-        pin.scroll_into_view_if_needed()
-        page.wait_for_timeout(800)
-        pin.click()
-        page.wait_for_timeout(3000)
-
-        img = page.locator('img[src*="pinimg"]').first
-        img_src = img.get_attribute('src')
-        img_hash = self.get_image_hash(img_src)
-
-        if img_hash in self.downloaded_hashes or img_hash in self.skipped_hashes:
-            page.go_back(wait_until='domcontentloaded')
-            page.wait_for_timeout(1000)
-            return False  # already processed
-
-        # Click "More options" then "Download"
-        more_button = None
-        for selector in ['[aria-label="More options"]', '[data-test-id="more-options-button"]',
-                         'button:has-text("More")', '[aria-label="More actions"]']:
+    def download_pin(self, page, pin, idx, board_url):
+        current_scroll = page.evaluate("window.scrollY")
+        outcome = "Failed"
+        try:
             try:
-                more_button = page.locator(selector).first
-                if more_button.is_visible(timeout=2000):
-                    break
+                pin.scroll_into_view_if_needed()
+                page.wait_for_timeout(random.randint(400, 900))
+                pin.click()
             except:
-                continue
+                page.wait_for_timeout(random.randint(400, 900))
+                pin.scroll_into_view_if_needed()
+                pin.click()
 
-        if not more_button:
-            print(f"Failed - couldn't find More options button")
-            page.go_back(wait_until='domcontentloaded')
-            page.wait_for_timeout(1000)
-            return False
+            page.wait_for_timeout(random.randint(1000, 2000))
 
-        more_button.click()
-        page.wait_for_timeout(1500)
+            # Check for new tabs (ads/popups) and close them
+            if len(page.context.pages) > 1:
+                for p in page.context.pages[1:]:
+                    print(f"[Pin {idx}] Closing unexpected new tab (ad)")
+                    p.close()
+                page.bring_to_front()
 
-        download_button = None
-        for selector in ['text="Download image"', 'text="Download"',
-                         '[data-test-id="download-button"]', 'div:has-text("Download image")']:
+            img = page.locator('img[src*="pinimg"]').first
+            img_src = img.get_attribute('src')
+            img_hash = self.get_image_hash(img_src)
+
+            if img_hash in self.downloaded_hashes:
+                outcome = "Skipped (already downloaded)"
+            elif img_hash in self.skipped_hashes:
+                outcome = "Skipped (too small)"
+            else:
+                more_button = None
+                for selector in ['[aria-label="More options"]', '[data-test-id="more-options-button"]',
+                                 'button:has-text("More")', '[aria-label="More actions"]']:
+                    try:
+                        more_button = page.locator(selector).first
+                        if more_button.is_visible(timeout=1000):
+                            break
+                    except:
+                        continue
+
+                if not more_button:
+                    outcome = "Failed (No More options button)"
+                else:
+                    more_button.click()
+                    page.wait_for_timeout(random.randint(300, 600))  # faster
+
+                    download_button = None
+                    for selector in ['text="Download image"', 'text="Download"',
+                                     '[data-test-id="download-button"]', 'div:has-text("Download image")']:
+                        try:
+                            download_button = page.locator(selector).first
+                            if download_button.is_visible(timeout=1000):
+                                break
+                        except:
+                            continue
+
+                    if not download_button:
+                        outcome = "Failed (No Download button)"
+                    else:
+                        with page.expect_download(timeout=20000) as download_info:
+                            download_button.click()
+                        download = download_info.value
+
+                        temp_path = os.path.join(
+                            self.output_folder, f"temp_{img_hash}")
+                        download.save_as(temp_path)
+                        file_size_kb = os.path.getsize(temp_path) / 1024
+
+                        if file_size_kb < 70:
+                            os.remove(temp_path)
+                            self.skipped_hashes.add(img_hash)
+                            self.save_database()
+                            outcome = f"Skipped (too small {file_size_kb:.1f} KB)"
+                        else:
+                            new_filename = f"{img_hash}_{download.suggested_filename}"
+                            final_path = os.path.join(
+                                self.output_folder, new_filename)
+                            os.rename(temp_path, final_path)
+                            self.downloaded_hashes.add(img_hash)
+                            self.save_database()
+                            outcome = f"Downloaded ({file_size_kb:.1f} KB)"
+
+        except Exception as e:
+            outcome = f"Failed ({str(e)})"
+        finally:
             try:
-                download_button = page.locator(selector).first
-                if download_button.is_visible(timeout=2000):
-                    break
-            except:
-                continue
+                page.go_back(wait_until='domcontentloaded')
+                page.wait_for_timeout(random.randint(500, 900))
+                page.evaluate(f"window.scrollTo(0, {current_scroll})")
+                page.wait_for_timeout(random.randint(300, 700))
 
-        if not download_button:
-            print(f"Failed - couldn't find Download button")
-            page.go_back(wait_until='domcontentloaded')
-            page.wait_for_timeout(1000)
-            return False
+                # Ensure we returned to the board page
+                if board_url not in page.url:
+                    raise Exception(
+                        f"Did not return to board page! Current URL: {page.url}")
 
-        with page.expect_download(timeout=30000) as download_info:
-            download_button.click()
-        download = download_info.value
+            except Exception as e:
+                print(f"[Pin {idx}] ERROR: {e}")
+                raise e
 
-        temp_path = os.path.join(self.output_folder, f"temp_{img_hash}")
-        download.save_as(temp_path)
-        file_size_kb = os.path.getsize(temp_path) / 1024
-
-        if file_size_kb < 70:
-            os.remove(temp_path)
-            self.skipped_hashes.add(img_hash)
-            self.save_database()
-            print(f"Skipped - too small ({file_size_kb:.1f} KB)")
-        else:
-            new_filename = f"{img_hash}_{download.suggested_filename}"
-            final_path = os.path.join(self.output_folder, new_filename)
-            os.rename(temp_path, final_path)
-            self.downloaded_hashes.add(img_hash)
-            self.save_database()
-            print(f"Downloaded: {new_filename} ({file_size_kb:.1f} KB)")
-
-        page.go_back(wait_until='domcontentloaded')
-        page.wait_for_timeout(1000)
-        return True
+        print(f"[Pin {idx}] Clicked → {outcome}")
+        return outcome.startswith("Downloaded")
 
     def download_images_from_board(self, board_url, headless=False, username=None, password=None):
-        """Download all images from a Pinterest board while scrolling"""
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=headless,
@@ -184,7 +207,6 @@ class PinterestDownloader:
             )
             page = context.new_page()
 
-            # Login
             if username and password:
                 login_success = self.login_to_pinterest(
                     page, username, password)
@@ -196,15 +218,15 @@ class PinterestDownloader:
                 input(
                     "\nPlease log in to Pinterest manually and press Enter to continue...")
 
-            # Open board
             page.goto(board_url, timeout=60000, wait_until='domcontentloaded')
-            page.wait_for_timeout(5000)
+            page.wait_for_timeout(random.randint(2000, 3000))
 
             print("Starting scrolling & downloading pins...")
             seen_hashes = set()
             downloaded_count = 0
             failed_count = 0
-            scroll_pause_time = 2
+            idx = 1
+            scroll_pause_time = 1.2
 
             while True:
                 pins = page.locator('[data-test-id="pin"]').all()
@@ -217,15 +239,17 @@ class PinterestDownloader:
                     if img_hash not in seen_hashes:
                         new_pin_found = True
                         seen_hashes.add(img_hash)
-                        try:
-                            if self.download_pin(page, pin):
-                                downloaded_count += 1
-                        except Exception as e:
-                            print(f"Failed to download pin: {e}")
+                        success = self.download_pin(
+                            page, pin, idx, board_url)
+                        if success:
+                            downloaded_count += 1
+                        else:
                             failed_count += 1
+                        idx += 1
 
                 page.evaluate("window.scrollBy(0, window.innerHeight)")
-                page.wait_for_timeout(scroll_pause_time * 1000)
+                page.wait_for_timeout(random.randint(
+                    int(scroll_pause_time*800), int(scroll_pause_time*1200)))
 
                 if not new_pin_found:
                     print("No new pins detected. Finished scrolling.")
@@ -260,22 +284,18 @@ def main():
     print(f"Output folder: {output_folder}")
 
     headless = headless_env.lower() in ('true', '1', 'yes') if headless_env else False
-    print(f"Headless mode: {headless}")
-
-    if not username or not password:
-        print("Manual login will be required.")
-    else:
-        print("Credentials found. Attempting automatic login.")
+    print(f"Headless: {headless}")
 
     downloader = PinterestDownloader(output_folder=output_folder)
 
     try:
         downloader.download_images_from_board(
-            board_url, headless=headless, username=username, password=password)
+            board_url, headless=headless, username=username, password=password
+        )
     except KeyboardInterrupt:
-        print("Download interrupted by user")
+        print("\nDownload interrupted by user")
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"\nAn error occurred: {str(e)}")
         import traceback
         traceback.print_exc()
 
