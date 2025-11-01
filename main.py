@@ -22,7 +22,7 @@ class PinterestDownloader:
         Path(output_folder).mkdir(parents=True, exist_ok=True)
         self.downloaded_hashes = set()
         self.skipped_hashes = set()
-        self.db_file = os.path.join(output_folder, ".pinterest_db.json")
+        self.db_file = ".pinterest_db.json"
         self.load_database()
 
     def load_database(self):
@@ -247,7 +247,10 @@ class PinterestDownloader:
                             failed_count += 1
                         idx += 1
 
-                page.evaluate("window.scrollBy(0, window.innerHeight)")
+                # Double the scroll amount
+                scroll_amount = page.evaluate(
+                    "window.innerHeight * 2")  # doubled scroll
+                page.evaluate(f"window.scrollBy(0, {scroll_amount})")
                 page.wait_for_timeout(random.randint(
                     int(scroll_pause_time*800), int(scroll_pause_time*1200)))
 
