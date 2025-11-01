@@ -1,5 +1,5 @@
 """
-Pinterest Board Image Downloader (Playwright)
+Pinterest Board Image Downloader (Playwright) with .env support
 Downloads images from a Pinterest board using the built-in download button
 """
 
@@ -9,6 +9,10 @@ import os
 import hashlib
 import json
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 
 class PinterestDownloader:
@@ -16,13 +20,12 @@ class PinterestDownloader:
         self.output_folder = output_folder
         Path(output_folder).mkdir(parents=True, exist_ok=True)
         self.downloaded_hashes = set()
-        self.skipped_hashes = set()  # For images under 70KB
+        self.skipped_hashes = set()
         self.db_file = os.path.join(output_folder, ".pinterest_db.json")
         self.load_database()
 
     def load_database(self):
         """Load hashes of existing and skipped files"""
-        # Load from JSON database
         if os.path.exists(self.db_file):
             try:
                 with open(self.db_file, 'r') as f:
@@ -32,7 +35,6 @@ class PinterestDownloader:
             except:
                 pass
 
-        # Also scan existing files
         for filename in os.listdir(self.output_folder):
             if filename.endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
                 hash_part = filename.split(
@@ -56,10 +58,10 @@ class PinterestDownloader:
         return hashlib.md5(img_url.encode()).hexdigest()[:12]
 
     def scroll_to_load_all_pins(self, page):
-        """Scroll through the page to load all pins - AGGRESSIVE VERSION"""
+        """Scroll through the page to load all pins"""
         print("Loading all pins from board...")
 
-        scroll_pause_time = 3  # Increased wait time
+        scroll_pause_time = 3
         max_scrolls = 100
         scrolls = 0
         consecutive_no_change = 0
@@ -67,7 +69,6 @@ class PinterestDownloader:
 
         while scrolls < max_scrolls and consecutive_no_change < 5:
             try:
-                # Get current pins count
                 pins = page.locator('[data-test-id="pin"]').all()
                 current_count = len(pins)
 
@@ -77,11 +78,8 @@ class PinterestDownloader:
                 else:
                     consecutive_no_change += 1
 
-                # Scroll to bottom
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(scroll_pause_time * 1000)
-
-                # Also try scrolling by pixels to trigger lazy loading
                 page.evaluate("window.scrollBy(0, 500)")
                 page.wait_for_timeout(1000)
 
@@ -92,13 +90,12 @@ class PinterestDownloader:
                 print(f"Error during scrolling: {e}")
                 break
 
-        # Get final count
         try:
             final_pins = page.locator('[data-test-id="pin"]').all()
             final_count = len(final_pins)
             print(f"Finished loading. Found {final_count} total pins")
 
-            if final_count < 50:  # If suspiciously low
+            if final_count < 50:
                 print(
                     f"⚠️  Warning: Only found {final_count} pins. This seems low.")
                 print("The page might not have loaded fully. Waiting longer...")
@@ -111,10 +108,49 @@ class PinterestDownloader:
             print(f"Error getting final pin count: {e}")
             return []
 
-    def download_images_from_board(self, board_url, headless=False):
+    def login_to_pinterest(self, page, username, password):
+        """Attempt to login to Pinterest with credentials"""
+        try:
+            print("Attempting to log in to Pinterest...")
+            page.goto("https://www.pinterest.com/login/")
+            page.wait_for_timeout(2000)
+
+            # Fill email
+            email_input = page.locator('input[id="email"]')
+            if email_input.is_visible(timeout=5000):
+                email_input.fill(username)
+                page.wait_for_timeout(500)
+
+                # Fill password
+                password_input = page.locator('input[id="password"]')
+                password_input.fill(password)
+                page.wait_for_timeout(500)
+
+                # Click login button
+                login_button = page.locator('button[type="submit"]').first
+                login_button.click()
+
+                print("Login credentials submitted. Waiting for login to complete...")
+                page.wait_for_timeout(5000)
+
+                # Check if login was successful
+                if "pinterest.com/login" not in page.url:
+                    print("✓ Login successful!")
+                    return True
+                else:
+                    print("⚠ Login may have failed or requires verification")
+                    return False
+            else:
+                print("Could not find login form")
+                return False
+
+        except Exception as e:
+            print(f"Error during automated login: {e}")
+            return False
+
+    def download_images_from_board(self, board_url, headless=False, username=None, password=None):
         """Download all images from a Pinterest board"""
         with sync_playwright() as p:
-            # Launch browser
             browser = p.chromium.launch(
                 headless=headless,
                 args=['--disable-blink-features=AutomationControlled']
@@ -126,34 +162,40 @@ class PinterestDownloader:
             )
             page = context.new_page()
 
-            # Navigate to Pinterest and login
-            print("Opening Pinterest login page...")
-            page.goto("https://www.pinterest.com/login/")
-
-            input(
-                "\nPlease log in to Pinterest in the browser window and press Enter to continue...")
+            # Login
+            if username and password:
+                login_success = self.login_to_pinterest(
+                    page, username, password)
+                if not login_success and not headless:
+                    input(
+                        "\nPlease complete login manually in the browser and press Enter to continue...")
+            else:
+                print("Opening Pinterest login page...")
+                page.goto("https://www.pinterest.com/login/")
+                input(
+                    "\nPlease log in to Pinterest in the browser window and press Enter to continue...")
 
             # Navigate to board
             print(f"\nOpening board: {board_url}")
             try:
                 page.goto(board_url, timeout=60000,
                           wait_until='domcontentloaded')
-                page.wait_for_timeout(5000)  # Increased initial wait
+                page.wait_for_timeout(5000)
 
-                # Check if we're actually on the board page
                 if "pinterest.com" not in page.url:
                     print(f"Warning: Redirected to {page.url}")
-                    input(
-                        "Please navigate to your board manually and press Enter to continue...")
+                    if not headless:
+                        input(
+                            "Please navigate to your board manually and press Enter to continue...")
 
-                # Wait for pins to appear
                 page.wait_for_selector('[data-test-id="pin"]', timeout=10000)
                 page.wait_for_timeout(3000)
             except Exception as e:
                 print(f"Error loading board: {e}")
                 print("Current URL:", page.url)
-                input(
-                    "Please navigate to your board manually in the browser and press Enter to continue...")
+                if not headless:
+                    input(
+                        "Please navigate to your board manually in the browser and press Enter to continue...")
 
             # Load all pins
             pins = self.scroll_to_load_all_pins(page)
@@ -162,7 +204,8 @@ class PinterestDownloader:
             if total_pins == 0:
                 print(
                     "ERROR: No pins found! Make sure you're on the correct board page.")
-                input("Press Enter to close...")
+                if not headless:
+                    input("Press Enter to close...")
                 browser.close()
                 return
 
@@ -171,13 +214,11 @@ class PinterestDownloader:
             skipped_small = 0
             failed = 0
 
-            # Store the board URL to navigate back if needed
             board_page_url = page.url
 
             # Process each pin
             for idx in range(total_pins):
                 try:
-                    # Make sure we're on the board page
                     if board_page_url not in page.url:
                         print(
                             f"[{idx+1}/{total_pins}] Navigating back to board...")
@@ -186,7 +227,6 @@ class PinterestDownloader:
                         page.wait_for_selector(
                             '[data-test-id="pin"]', timeout=10000)
 
-                    # Re-query pins to avoid stale elements
                     current_pins = page.locator('[data-test-id="pin"]').all()
                     if idx >= len(current_pins):
                         print(
@@ -202,26 +242,18 @@ class PinterestDownloader:
                             continue
 
                     pin = current_pins[idx]
-
-                    # Scroll pin into view
                     pin.scroll_into_view_if_needed()
                     page.wait_for_timeout(800)
-
-                    # Click the pin to open closeup view
                     pin.click()
-                    page.wait_for_timeout(3000)  # Increased wait for page load
+                    page.wait_for_timeout(3000)
 
                     try:
-                        # Wait for the image to load in closeup view
                         page.wait_for_selector(
                             'img[src*="pinimg"]', timeout=8000)
-
-                        # Get image source to check if already downloaded
                         img = page.locator('img[src*="pinimg"]').first
                         img_src = img.get_attribute('src')
                         img_hash = self.get_image_hash(img_src)
 
-                        # Check if already downloaded or skipped
                         if img_hash in self.downloaded_hashes:
                             print(
                                 f"[{idx+1}/{total_pins}] Skipping - already downloaded")
@@ -231,7 +263,6 @@ class PinterestDownloader:
                                 f"[{idx+1}/{total_pins}] Skipping - previously marked as too small")
                             skipped_small += 1
                         else:
-                            # Look for "More options" button
                             more_button = None
                             selectors = [
                                 '[aria-label="More options"]',
@@ -253,11 +284,9 @@ class PinterestDownloader:
                                     f"[{idx+1}/{total_pins}] Failed - couldn't find More options button")
                                 failed += 1
                             else:
-                                # Click more options
                                 more_button.click()
                                 page.wait_for_timeout(1500)
 
-                                # Look for download option
                                 download_button = None
                                 download_texts = [
                                     'text="Download image"',
@@ -280,23 +309,18 @@ class PinterestDownloader:
                                         f"[{idx+1}/{total_pins}] Failed - couldn't find Download button")
                                     failed += 1
                                 else:
-                                    # Click download and handle the download
                                     with page.expect_download(timeout=30000) as download_info:
                                         download_button.click()
 
                                     download = download_info.value
-
-                                    # Save to temp location first to check size
                                     temp_path = os.path.join(
                                         self.output_folder, f"temp_{img_hash}")
                                     download.save_as(temp_path)
 
-                                    # Check file size
                                     file_size = os.path.getsize(temp_path)
                                     file_size_kb = file_size / 1024
 
                                     if file_size_kb < 70:
-                                        # Too small - delete and add to skip list
                                         os.remove(temp_path)
                                         self.skipped_hashes.add(img_hash)
                                         self.save_database()
@@ -304,7 +328,6 @@ class PinterestDownloader:
                                             f"[{idx+1}/{total_pins}] Skipped - too small ({file_size_kb:.1f} KB)")
                                         skipped_small += 1
                                     else:
-                                        # Good size - rename to final name
                                         original_name = download.suggested_filename
                                         new_filename = f"{img_hash}_{original_name}"
                                         final_path = os.path.join(
@@ -328,17 +351,13 @@ class PinterestDownloader:
                         print(f"[{idx+1}/{total_pins}] Failed - {str(e)}")
                         failed += 1
 
-                    # Go back to the board
                     try:
                         page.go_back(wait_until='domcontentloaded')
                         page.wait_for_timeout(2000)
-
-                        # Wait for pins to be visible again
                         page.wait_for_selector(
                             '[data-test-id="pin"]', timeout=8000)
                     except Exception as e:
                         print(f"Warning: Error going back - {e}")
-                        # Fallback: navigate directly to board
                         try:
                             page.goto(board_page_url)
                             page.wait_for_timeout(2000)
@@ -350,7 +369,6 @@ class PinterestDownloader:
                         f"[{idx+1}/{total_pins}] Error processing pin: {str(e)}")
                     failed += 1
 
-                    # Try to get back to board
                     try:
                         if board_page_url not in page.url:
                             page.goto(board_page_url)
@@ -367,7 +385,8 @@ class PinterestDownloader:
             print(f"Total pins processed: {total_pins}")
             print("="*50)
 
-            input("\nPress Enter to close the browser...")
+            if not headless:
+                input("\nPress Enter to close the browser...")
             browser.close()
 
 
@@ -375,17 +394,43 @@ def main():
     print("Pinterest Board Image Downloader")
     print("="*50)
 
-    # Configuration
-    BOARD_URL = input("Enter your Pinterest board URL: ").strip()
-    OUTPUT_FOLDER = input(
-        "Enter output folder name (default: pinterest_images): ").strip() or "pinterest_images"
-    HEADLESS = input(
-        "Run in headless mode? (y/n, default: n): ").strip().lower() == 'y'
+    # Get configuration from .env or user input
+    board_url = os.getenv('PINTEREST_BOARD_URL')
+    output_folder = os.getenv('OUTPUT_FOLDER', 'pinterest_images')
+    headless = os.getenv('HEADLESS', 'false').lower() in ('true', '1', 'yes')
+    username = os.getenv('PINTEREST_USERNAME')
+    password = os.getenv('PINTEREST_PASSWORD')
 
-    downloader = PinterestDownloader(output_folder=OUTPUT_FOLDER)
+    # If not in .env, ask user
+    if not board_url:
+        board_url = input("Enter your Pinterest board URL: ").strip()
+    else:
+        print(f"Board URL: {board_url}")
+
+    if not output_folder or output_folder == 'pinterest_images':
+        user_input = input(
+            "Enter output folder name (default: pinterest_images): ").strip()
+        if user_input:
+            output_folder = user_input
+    print(f"Output folder: {output_folder}")
+
+    if not headless:
+        user_input = input(
+            "Run in headless mode? (y/n, default: n): ").strip().lower()
+        if user_input == 'y':
+            headless = True
+    print(f"Headless mode: {headless}")
+
+    if not username or not password:
+        print("\nNote: No credentials in .env file. Manual login will be required.")
+    else:
+        print("\nNote: Credentials found in .env file. Will attempt automatic login.")
+
+    downloader = PinterestDownloader(output_folder=output_folder)
 
     try:
-        downloader.download_images_from_board(BOARD_URL, headless=HEADLESS)
+        downloader.download_images_from_board(
+            board_url, headless=headless, username=username, password=password)
     except KeyboardInterrupt:
         print("\n\nDownload interrupted by user")
     except Exception as e:
