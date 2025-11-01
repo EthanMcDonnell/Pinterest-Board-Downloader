@@ -248,35 +248,23 @@ class PinterestDownloader:
                         print(f"[{idx+1}/{total_pins}] Failed - {str(e)}")
                         failed += 1
 
-                    # Close the pin closeup view
+                    # Go back to the board instead of just closing
                     try:
-                        # Try multiple ways to close
-                        close_selectors = [
-                            '[aria-label="Close"]',
-                            '[data-test-id="closeup-close-button"]',
-                            'button:has-text("Close")'
-                        ]
+                        # Use browser back button to return to board
+                        page.go_back()
+                        page.wait_for_timeout(1500)
 
-                        closed = False
-                        for selector in close_selectors:
-                            try:
-                                close_button = page.locator(selector).first
-                                if close_button.is_visible(timeout=1000):
-                                    close_button.click()
-                                    closed = True
-                                    break
-                            except:
-                                continue
-
-                        if not closed:
-                            # Fallback to Escape key
+                        # Wait for pins to be visible again
+                        page.wait_for_selector(
+                            '[data-test-id="pin"]', timeout=5000)
+                    except Exception as e:
+                        print(f"Warning: Error going back - {e}")
+                        # Fallback: try to close and reload if needed
+                        try:
                             page.keyboard.press('Escape')
-
-                        page.wait_for_timeout(1000)
-                    except:
-                        # Try Escape as last resort
-                        page.keyboard.press('Escape')
-                        page.wait_for_timeout(1000)
+                            page.wait_for_timeout(1000)
+                        except:
+                            pass
 
                 except Exception as e:
                     print(
