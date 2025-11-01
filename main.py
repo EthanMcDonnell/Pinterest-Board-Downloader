@@ -7,6 +7,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 import time
 import os
 import hashlib
+import json
 from pathlib import Path
 
 
@@ -15,60 +16,78 @@ class PinterestDownloader:
         self.output_folder = output_folder
         Path(output_folder).mkdir(parents=True, exist_ok=True)
         self.downloaded_hashes = set()
-        self.load_existing_hashes()
+        self.skipped_hashes = set()  # For images under 70KB
+        self.db_file = os.path.join(output_folder, ".pinterest_db.json")
+        self.load_database()
 
-    def load_existing_hashes(self):
-        """Load hashes of existing files to avoid re-downloading"""
+    def load_database(self):
+        """Load hashes of existing and skipped files"""
+        # Load from JSON database
+        if os.path.exists(self.db_file):
+            try:
+                with open(self.db_file, 'r') as f:
+                    db = json.load(f)
+                    self.downloaded_hashes = set(db.get('downloaded', []))
+                    self.skipped_hashes = set(db.get('skipped', []))
+            except:
+                pass
+
+        # Also scan existing files
         for filename in os.listdir(self.output_folder):
             if filename.endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
-                # Extract hash from filename if it exists
                 hash_part = filename.split(
                     '_')[0] if '_' in filename else filename.split('.')[0]
                 self.downloaded_hashes.add(hash_part)
+
         print(f"Found {len(self.downloaded_hashes)} existing images")
+        print(f"Found {len(self.skipped_hashes)} skipped images (too small)")
+
+    def save_database(self):
+        """Save the database of downloaded and skipped hashes"""
+        db = {
+            'downloaded': list(self.downloaded_hashes),
+            'skipped': list(self.skipped_hashes)
+        }
+        with open(self.db_file, 'w') as f:
+            json.dump(db, f, indent=2)
 
     def get_image_hash(self, img_url):
         """Generate a hash for the image URL"""
         return hashlib.md5(img_url.encode()).hexdigest()[:12]
 
     def scroll_to_load_all_pins(self, page):
-        """Scroll through the page to load all pins"""
+        """Scroll through the page to load all pins - AGGRESSIVE VERSION"""
         print("Loading all pins from board...")
 
-        previous_height = 0
-        scroll_pause_time = 2
-        max_scrolls = 50  # Prevent infinite scrolling
+        scroll_pause_time = 3  # Increased wait time
+        max_scrolls = 100
         scrolls = 0
-        no_change_count = 0
+        consecutive_no_change = 0
+        last_count = 0
 
-        while scrolls < max_scrolls:
+        while scrolls < max_scrolls and consecutive_no_change < 5:
             try:
                 # Get current pins count
                 pins = page.locator('[data-test-id="pin"]').all()
                 current_count = len(pins)
-                print(f"Loaded {current_count} pins...")
 
-                # Scroll down
+                if current_count != last_count:
+                    print(f"Loaded {current_count} pins...")
+                    consecutive_no_change = 0
+                else:
+                    consecutive_no_change += 1
+
+                # Scroll to bottom
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(scroll_pause_time * 1000)
 
-                # Get new height
-                new_height = page.evaluate("document.body.scrollHeight")
+                # Also try scrolling by pixels to trigger lazy loading
+                page.evaluate("window.scrollBy(0, 500)")
+                page.wait_for_timeout(1000)
 
-                # Get new pins count after scroll
-                pins_after = page.locator('[data-test-id="pin"]').all()
-                new_count = len(pins_after)
-
-                # If no new pins loaded and height hasn't changed, increment counter
-                if new_count == current_count and new_height == previous_height:
-                    no_change_count += 1
-                    if no_change_count >= 3:
-                        break
-                else:
-                    no_change_count = 0
-
-                previous_height = new_height
+                last_count = current_count
                 scrolls += 1
+
             except Exception as e:
                 print(f"Error during scrolling: {e}")
                 break
@@ -76,7 +95,17 @@ class PinterestDownloader:
         # Get final count
         try:
             final_pins = page.locator('[data-test-id="pin"]').all()
-            print(f"Finished loading. Found {len(final_pins)} total pins")
+            final_count = len(final_pins)
+            print(f"Finished loading. Found {final_count} total pins")
+
+            if final_count < 50:  # If suspiciously low
+                print(
+                    f"⚠️  Warning: Only found {final_count} pins. This seems low.")
+                print("The page might not have loaded fully. Waiting longer...")
+                page.wait_for_timeout(5000)
+                final_pins = page.locator('[data-test-id="pin"]').all()
+                print(f"After waiting: {len(final_pins)} pins")
+
             return final_pins
         except Exception as e:
             print(f"Error getting final pin count: {e}")
@@ -109,7 +138,7 @@ class PinterestDownloader:
             try:
                 page.goto(board_url, timeout=60000,
                           wait_until='domcontentloaded')
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(5000)  # Increased initial wait
 
                 # Check if we're actually on the board page
                 if "pinterest.com" not in page.url:
@@ -119,7 +148,7 @@ class PinterestDownloader:
 
                 # Wait for pins to appear
                 page.wait_for_selector('[data-test-id="pin"]', timeout=10000)
-                page.wait_for_timeout(2000)
+                page.wait_for_timeout(3000)
             except Exception as e:
                 print(f"Error loading board: {e}")
                 print("Current URL:", page.url)
@@ -130,47 +159,79 @@ class PinterestDownloader:
             pins = self.scroll_to_load_all_pins(page)
             total_pins = len(pins)
 
+            if total_pins == 0:
+                print(
+                    "ERROR: No pins found! Make sure you're on the correct board page.")
+                input("Press Enter to close...")
+                browser.close()
+                return
+
             downloaded = 0
             skipped = 0
+            skipped_small = 0
             failed = 0
+
+            # Store the board URL to navigate back if needed
+            board_page_url = page.url
 
             # Process each pin
             for idx in range(total_pins):
                 try:
-                    # Re-query pins each iteration to avoid stale elements
+                    # Make sure we're on the board page
+                    if board_page_url not in page.url:
+                        print(
+                            f"[{idx+1}/{total_pins}] Navigating back to board...")
+                        page.goto(board_page_url)
+                        page.wait_for_timeout(2000)
+                        page.wait_for_selector(
+                            '[data-test-id="pin"]', timeout=10000)
+
+                    # Re-query pins to avoid stale elements
                     current_pins = page.locator('[data-test-id="pin"]').all()
                     if idx >= len(current_pins):
-                        print(f"[{idx+1}/{total_pins}] Pin no longer available")
-                        failed += 1
-                        continue
+                        print(
+                            f"[{idx+1}/{total_pins}] Pin index out of range, re-querying...")
+                        page.wait_for_timeout(2000)
+                        current_pins = page.locator(
+                            '[data-test-id="pin"]').all()
+
+                        if idx >= len(current_pins):
+                            print(
+                                f"[{idx+1}/{total_pins}] Pin no longer available")
+                            failed += 1
+                            continue
 
                     pin = current_pins[idx]
 
                     # Scroll pin into view
                     pin.scroll_into_view_if_needed()
-                    page.wait_for_timeout(500)
+                    page.wait_for_timeout(800)
 
                     # Click the pin to open closeup view
                     pin.click()
-                    page.wait_for_timeout(2000)
+                    page.wait_for_timeout(3000)  # Increased wait for page load
 
                     try:
                         # Wait for the image to load in closeup view
                         page.wait_for_selector(
-                            'img[src*="pinimg"]', timeout=5000)
+                            'img[src*="pinimg"]', timeout=8000)
 
                         # Get image source to check if already downloaded
                         img = page.locator('img[src*="pinimg"]').first
                         img_src = img.get_attribute('src')
                         img_hash = self.get_image_hash(img_src)
 
-                        # Check if already downloaded
+                        # Check if already downloaded or skipped
                         if img_hash in self.downloaded_hashes:
                             print(
                                 f"[{idx+1}/{total_pins}] Skipping - already downloaded")
                             skipped += 1
+                        elif img_hash in self.skipped_hashes:
+                            print(
+                                f"[{idx+1}/{total_pins}] Skipping - previously marked as too small")
+                            skipped_small += 1
                         else:
-                            # Look for "More actions" button - try multiple selectors
+                            # Look for "More options" button
                             more_button = None
                             selectors = [
                                 '[aria-label="More options"]',
@@ -182,7 +243,7 @@ class PinterestDownloader:
                             for selector in selectors:
                                 try:
                                     more_button = page.locator(selector).first
-                                    if more_button.is_visible(timeout=1000):
+                                    if more_button.is_visible(timeout=2000):
                                         break
                                 except:
                                     continue
@@ -194,9 +255,9 @@ class PinterestDownloader:
                             else:
                                 # Click more options
                                 more_button.click()
-                                page.wait_for_timeout(1000)
+                                page.wait_for_timeout(1500)
 
-                                # Look for download option - try multiple text variations
+                                # Look for download option
                                 download_button = None
                                 download_texts = [
                                     'text="Download image"',
@@ -209,7 +270,7 @@ class PinterestDownloader:
                                     try:
                                         download_button = page.locator(
                                             selector).first
-                                        if download_button.is_visible(timeout=1000):
+                                        if download_button.is_visible(timeout=2000):
                                             break
                                     except:
                                         continue
@@ -225,19 +286,38 @@ class PinterestDownloader:
 
                                     download = download_info.value
 
-                                    # Save with hash prefix
-                                    original_name = download.suggested_filename
-                                    ext = Path(original_name).suffix
-                                    new_filename = f"{img_hash}_{original_name}"
-                                    download_path = os.path.join(
-                                        self.output_folder, new_filename)
+                                    # Save to temp location first to check size
+                                    temp_path = os.path.join(
+                                        self.output_folder, f"temp_{img_hash}")
+                                    download.save_as(temp_path)
 
-                                    download.save_as(download_path)
-                                    self.downloaded_hashes.add(img_hash)
+                                    # Check file size
+                                    file_size = os.path.getsize(temp_path)
+                                    file_size_kb = file_size / 1024
 
-                                    print(
-                                        f"[{idx+1}/{total_pins}] Downloaded: {new_filename}")
-                                    downloaded += 1
+                                    if file_size_kb < 70:
+                                        # Too small - delete and add to skip list
+                                        os.remove(temp_path)
+                                        self.skipped_hashes.add(img_hash)
+                                        self.save_database()
+                                        print(
+                                            f"[{idx+1}/{total_pins}] Skipped - too small ({file_size_kb:.1f} KB)")
+                                        skipped_small += 1
+                                    else:
+                                        # Good size - rename to final name
+                                        original_name = download.suggested_filename
+                                        new_filename = f"{img_hash}_{original_name}"
+                                        final_path = os.path.join(
+                                            self.output_folder, new_filename)
+                                        os.rename(temp_path, final_path)
+
+                                        self.downloaded_hashes.add(img_hash)
+                                        self.save_database()
+
+                                        print(
+                                            f"[{idx+1}/{total_pins}] Downloaded: {new_filename} ({file_size_kb:.1f} KB)")
+                                        downloaded += 1
+
                                     page.wait_for_timeout(1000)
 
                     except PlaywrightTimeout:
@@ -248,21 +328,20 @@ class PinterestDownloader:
                         print(f"[{idx+1}/{total_pins}] Failed - {str(e)}")
                         failed += 1
 
-                    # Go back to the board instead of just closing
+                    # Go back to the board
                     try:
-                        # Use browser back button to return to board
-                        page.go_back()
-                        page.wait_for_timeout(1500)
+                        page.go_back(wait_until='domcontentloaded')
+                        page.wait_for_timeout(2000)
 
                         # Wait for pins to be visible again
                         page.wait_for_selector(
-                            '[data-test-id="pin"]', timeout=5000)
+                            '[data-test-id="pin"]', timeout=8000)
                     except Exception as e:
                         print(f"Warning: Error going back - {e}")
-                        # Fallback: try to close and reload if needed
+                        # Fallback: navigate directly to board
                         try:
-                            page.keyboard.press('Escape')
-                            page.wait_for_timeout(1000)
+                            page.goto(board_page_url)
+                            page.wait_for_timeout(2000)
                         except:
                             pass
 
@@ -271,10 +350,11 @@ class PinterestDownloader:
                         f"[{idx+1}/{total_pins}] Error processing pin: {str(e)}")
                     failed += 1
 
-                    # Try to close any open dialogs
+                    # Try to get back to board
                     try:
-                        page.keyboard.press('Escape')
-                        page.wait_for_timeout(500)
+                        if board_page_url not in page.url:
+                            page.goto(board_page_url)
+                            page.wait_for_timeout(2000)
                     except:
                         pass
 
@@ -282,8 +362,9 @@ class PinterestDownloader:
             print(f"Download complete!")
             print(f"Downloaded: {downloaded}")
             print(f"Skipped (already exists): {skipped}")
+            print(f"Skipped (too small < 70KB): {skipped_small}")
             print(f"Failed: {failed}")
-            print(f"Total pins: {total_pins}")
+            print(f"Total pins processed: {total_pins}")
             print("="*50)
 
             input("\nPress Enter to close the browser...")
@@ -309,6 +390,8 @@ def main():
         print("\n\nDownload interrupted by user")
     except Exception as e:
         print(f"\nAn error occurred: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
