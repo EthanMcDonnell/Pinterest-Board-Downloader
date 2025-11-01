@@ -394,38 +394,54 @@ def main():
     print("Pinterest Board Image Downloader")
     print("="*50)
 
-    # Get configuration from .env or user input
+    # Get configuration from .env
     board_url = os.getenv('PINTEREST_BOARD_URL')
-    output_folder = os.getenv('OUTPUT_FOLDER', 'pinterest_images')
-    headless = os.getenv('HEADLESS', 'false').lower() in ('true', '1', 'yes')
+    output_folder_env = os.getenv('OUTPUT_FOLDER')
+    headless_env = os.getenv('HEADLESS')
     username = os.getenv('PINTEREST_USERNAME')
     password = os.getenv('PINTEREST_PASSWORD')
 
-    # If not in .env, ask user
+    # ----------------------------
+    # Board URL
+    # ----------------------------
     if not board_url:
         board_url = input("Enter your Pinterest board URL: ").strip()
     else:
         print(f"Board URL: {board_url}")
 
-    if not output_folder or output_folder == 'pinterest_images':
+    # ----------------------------
+    # Output folder
+    # ----------------------------
+    if output_folder_env:
+        output_folder = output_folder_env
+    else:
         user_input = input(
             "Enter output folder name (default: pinterest_images): ").strip()
-        if user_input:
-            output_folder = user_input
+        output_folder = user_input if user_input else "pinterest_images"
     print(f"Output folder: {output_folder}")
 
-    if not headless:
+    # ----------------------------
+    # Headless mode
+    # ----------------------------
+    if headless_env is not None:
+        headless = headless_env.lower() in ('true', '1', 'yes')
+    else:
         user_input = input(
             "Run in headless mode? (y/n, default: n): ").strip().lower()
-        if user_input == 'y':
-            headless = True
+        headless = True if user_input == 'y' else False
     print(f"Headless mode: {headless}")
 
+    # ----------------------------
+    # Credentials notice
+    # ----------------------------
     if not username or not password:
         print("\nNote: No credentials in .env file. Manual login will be required.")
     else:
         print("\nNote: Credentials found in .env file. Will attempt automatic login.")
 
+    # ----------------------------
+    # Start download
+    # ----------------------------
     downloader = PinterestDownloader(output_folder=output_folder)
 
     try:
@@ -437,7 +453,6 @@ def main():
         print(f"\nAn error occurred: {str(e)}")
         import traceback
         traceback.print_exc()
-
 
 if __name__ == "__main__":
     main()
